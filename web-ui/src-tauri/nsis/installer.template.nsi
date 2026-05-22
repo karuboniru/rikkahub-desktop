@@ -234,10 +234,15 @@ Function PageReinstall
     !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$(chooseMaintenanceOption)"
   ; Upgrading
   ${ElseIf} $R0 = 1
-    StrCpy $R1 "$(olderOrUnknownVersionInstalled)"
-    StrCpy $R2 "$(uninstallBeforeInstalling)"
-    StrCpy $R3 "$(dontUninstall)"
-    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$(choowHowToInstall)"
+    ; Override Tauri's default localized strings here. The upstream defaults read like
+    ; "推荐先卸载当前版本后再进行安装" / "请勿卸载" which actively pushes users away from
+    ; cover install — exactly the opposite of what we want. We hard-code Chinese here
+    ; because Rikkahub is Chinese-first; English users will still understand the layout
+    ; (first option is highlighted as recommended).
+    StrCpy $R1 "系统中已安装旧版本的 ${PRODUCTNAME}。两种方式都不会动你的对话记录、模型配置和上传文件，推荐使用「覆盖安装」直接升级。"
+    StrCpy $R2 "覆盖安装（保留全部数据和配置，推荐）"
+    StrCpy $R3 "先卸载再安装（数据和配置仍会保留，仅清理程序文件）"
+    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "选择升级方式"
   ; Downgrading
   ${ElseIf} $R0 = -1
     StrCpy $R1 "$(newerVersionInstalled)"
@@ -325,10 +330,12 @@ Function PageLeaveReinstall
       Goto reinst_uninstall
     ${EndIf}
   ${ElseIf} $R0 = 1 ; Upgrading
-    ${If} $R1 = 1              ; User chose to uninstall
+    ; We swapped the radio button order above so the first button is "don't uninstall"
+    ; (cover install). Match the result mapping here.
+    ${If} $R1 = 1              ; User chose first (cover install / don't uninstall)
+      Goto reinst_done
+    ${Else}                    ; User chose second (uninstall first)
       Goto reinst_uninstall
-    ${Else}
-      Goto reinst_done         ; User chose NOT to uninstall
     ${EndIf}
   ${ElseIf} $R0 = -1 ; Downgrading
     ${If} $R1 = 1              ; User chose to uninstall
@@ -348,7 +355,16 @@ Function PageLeaveReinstall
     ${Else}
       ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
       ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-      ${IfThen} $UpdateMode = 1 ${|} StrCpy $R1 "$R1 /UPDATE" ${|} ; append /UPDATE
+      ; Always pass /UPDATE here, not just when $UpdateMode=1. This is the "uninstall first
+      ; then install" branch reached from PageReinstall, and the user-facing semantic must
+      ; be: "preserve all data and config." /UPDATE makes the uninstaller skip the "delete
+      ; app data" code path even if the user accidentally checks that box on the uninstall
+      ; confirmation page — protecting %APPDATA%\com.rikkahub.pc\user-config.json so the
+      ; new install's data-dir page can read it back and preserve the user's chosen path.
+      ; The user-data pc-data folder itself was never deleted by the uninstaller anyway
+      ; (it only `Delete`s the specific files the installer dropped), so combined with
+      ; this fix, "uninstall first" is now functionally as safe as cover-install.
+      StrCpy $R1 "$R1 /UPDATE"
       ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
       StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
       ExecWait '$R1' $0

@@ -66,6 +66,7 @@ import { openExternal } from "~/lib/external-link";
 import api, { appendWebAuthQuery } from "~/services/api";
 import { useSettingsStore } from "~/stores/app-store";
 import type { AsrProviderProfile, AsrProviderType, AssistantAvatar, AssistantProfile, ProviderModel, ProviderProfile, SearchServiceOption, Settings, TtsProviderProfile, TtsProviderType } from "~/types";
+import { ModelEditDialog } from "~/components/model-edit-dialog";
 
 type Section = "general" | "providers" | "models" | "assistants" | "search" | "mcp" | "speech" | "data" | "stats" | "logs" | "proxy" | "about" | "plan";
 type ProviderKind = "openai" | "claude" | "google";
@@ -1121,10 +1122,6 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
       : (draft.models ?? []).filter((item) => item.modelId !== model.modelId);
     patchDraft({ models });
   };
-  const updateModelType = (modelId: string, type: "CHAT" | "IMAGE" | "EMBEDDING") => {
-    const models = (draft.models ?? []).map((item) => item.modelId === modelId ? { ...item, type } : item);
-    patchDraft({ models });
-  };
   const toggleModelAbility = (modelId: string, ability: "TOOL" | "REASONING", enabled: boolean) => {
     const models = (draft.models ?? []).map((item) => {
       if (item.modelId !== modelId) return item;
@@ -1135,6 +1132,96 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
       return { ...item, abilities: next };
     });
     patchDraft({ models });
+  };
+  // -------- Model add/edit dialog state ----------------------------------------------------
+  // Single dialog instance reused for both add (+ button) and edit (row click). The mode +
+  // modelIdLocked flags determine the dialog UX. State is reset every time the dialog opens
+  // (see ModelEditDialog's useEffect on `open`), so reusing one instance is safe.
+  type ModelDialogState = {
+    mode: "add" | "edit";
+    model: ProviderModel;
+    modelIdLocked: boolean;
+  };
+  const [modelDialog, setModelDialog] = React.useState<ModelDialogState | null>(null);
+
+  const openAddModelDialog = () => {
+    if (!draft) return;
+    const uuid = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setModelDialog({
+      mode: "add",
+      modelIdLocked: false,
+      model: {
+        id: uuid,
+        modelId: "",
+        displayName: "",
+        type: "CHAT",
+        inputModalities: ["TEXT"],
+        outputModalities: ["TEXT"],
+        abilities: [],
+        tools: [],
+        customHeaders: [],
+        customBodies: [],
+        manuallyAdded: true,
+      },
+    });
+  };
+
+  const openEditModelDialog = (model: ProviderModel) => {
+    if (!draft) return;
+    // Prefer the persisted entry (with the user's prior customizations) over the fetched one.
+    // If model isn't enabled yet, fall back to the fetched row — saving will auto-enable.
+    const persisted = (draft.models ?? []).find((item) => item.modelId === model.modelId);
+    const source = persisted ?? model;
+    // Manually-added models keep ID editable; everything else (fetched, legacy) is locked
+    // because the modelId is sent verbatim to the upstream API and editing it would silently
+    // break request routing. See server.ts:6158, 6168, 6313.
+    const isManual = source.manuallyAdded === true;
+    setModelDialog({
+      mode: "edit",
+      modelIdLocked: !isManual,
+      model: { ...source },
+    });
+  };
+
+  const handleModelDialogSave = (model: ProviderModel) => {
+    if (!draft || !modelDialog) return;
+    const existing = (draft.models ?? []).find((item) => item.id === model.id);
+    let models: ProviderModel[];
+    if (existing) {
+      // Edit existing persisted model — replace by UUID id (stable across re-fetches).
+      models = (draft.models ?? []).map((item) => (item.id === model.id ? model : item));
+    } else if (modelDialog.mode === "add") {
+      // Brand-new manual add — also reject duplicate modelId to avoid confusing dedup behavior
+      // downstream (toggleModel matches by modelId, not id, so a clash would orphan the new one).
+      const clash = (draft.models ?? []).some((item) => item.modelId === model.modelId);
+      if (clash) {
+        toast.error(`已存在 modelId 为「${model.modelId}」的模型，请换一个 ID`);
+        return;
+      }
+      models = [...(draft.models ?? []), model];
+    } else {
+      // Edit dialog opened on a fetched-but-not-yet-enabled row → save auto-enables.
+      // Dedup by modelId in case the user toggled the checkbox in parallel.
+      const without = (draft.models ?? []).filter((item) => item.modelId !== model.modelId);
+      models = [...without, model];
+    }
+    patchDraft({ models });
+    toast.success(modelDialog.mode === "add" ? "模型已添加" : "模型已保存");
+  };
+
+  const handleModelDialogDelete = () => {
+    if (!draft || !modelDialog) return;
+    const target = modelDialog.model;
+    // Remove by both id AND modelId to be safe — if the model came from a fetched row whose
+    // id wasn't yet in draft.models, the id match alone wouldn't find anything.
+    patchDraft({
+      models: (draft.models ?? []).filter(
+        (item) => item.id !== target.id && item.modelId !== target.modelId,
+      ),
+    });
+    toast.success("模型已删除");
   };
   const addProvider = async () => {
     const next = createProvider();
@@ -1312,13 +1399,32 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
                 <div className="text-sm font-medium">模型列表</div>
                 <div className="text-xs text-muted-foreground">先获取供应商模型，再勾选要启用的模型。当前已启用 {draft.models?.length ?? 0} 个。</div>
               </div>
-              <Button variant="outline" onClick={fetchModels} disabled={fetchingModels}>
-                {fetchingModels ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-                获取模型列表
-              </Button>
+              <div className="flex gap-2">
+                <Button variant="outline" onClick={openAddModelDialog} title="手动添加模型（用于上游列表里没有的自定义模型）">
+                  <Plus className="size-4" />
+                  添加模型
+                </Button>
+                <Button variant="outline" onClick={fetchModels} disabled={fetchingModels}>
+                  {fetchingModels ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                  获取模型列表
+                </Button>
+              </div>
             </div>
             <div className="max-h-72 space-y-2 overflow-auto">
-              {(fetchedModels.length ? fetchedModels : draft.models ?? []).map((model) => {
+              {(() => {
+                // Display source: merge fetchedModels with draft.models, deduping by modelId.
+                // Without the merge, manually-added models would be invisible right after the
+                // user fetched the upstream list (because fetched.length > 0 made the old code
+                // skip draft entries). Fetched entries win on overlap because they're the
+                // canonical upstream-facing view; persisted customizations are still applied
+                // per-row via the `persisted` lookup below.
+                const fetched = fetchedModels;
+                const drafts = draft.models ?? [];
+                if (fetched.length === 0) return drafts;
+                const fetchedIds = new Set(fetched.map((m) => m.modelId));
+                const extras = drafts.filter((m) => !fetchedIds.has(m.modelId));
+                return [...fetched, ...extras];
+              })().map((model) => {
                 const focused = focusedModelId && (model.modelId === focusedModelId || model.id === focusedModelId);
                 const enabled = selectedModelIds.has(model.modelId);
                 const persisted = (draft.models ?? []).find((item) => item.modelId === model.modelId);
@@ -1327,68 +1433,67 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
                 const hasTool = currentAbilities.includes("TOOL");
                 const hasReasoning = currentAbilities.includes("REASONING");
                 return (
-                <label
+                <div
                   key={model.id ?? model.modelId}
+                  // The row itself is the click target for the edit dialog. The checkbox and
+                  // ability buttons inside stop propagation so they keep their own semantics.
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => openEditModelDialog(model)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      openEditModelDialog(model);
+                    }
+                  }}
                   className={cn(
-                    "flex items-center gap-3 rounded-md border px-3 py-2 transition",
+                    "flex cursor-pointer items-center gap-3 rounded-md border px-3 py-2 transition hover:border-primary/40 hover:bg-muted/40",
                     focused && "border-primary bg-primary/5 shadow-sm",
                   )}
                 >
-                  <Checkbox checked={enabled} onCheckedChange={(checked) => toggleModel(model, checked === true)} />
+                  <span onClick={(event) => event.stopPropagation()}>
+                    <Checkbox checked={enabled} onCheckedChange={(checked) => toggleModel(model, checked === true)} />
+                  </span>
                   <AIIcon name={model.modelId} size={28} />
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-sm font-medium">{model.displayName || model.modelId}</span>
                     <span className="block truncate text-xs text-muted-foreground">{model.modelId}</span>
                   </span>
-                  {enabled ? (
+                  {enabled && currentType === "CHAT" ? (
                     <div className="flex items-center gap-1.5">
-                      {currentType === "CHAT" ? (
-                        <>
-                          <button
-                            type="button"
-                            onClick={(event) => { event.preventDefault(); toggleModelAbility(model.modelId, "TOOL", !hasTool); }}
-                            className={cn(
-                              "h-7 rounded-md border px-2 text-xs transition",
-                              hasTool
-                                ? "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-                                : "border-border text-muted-foreground hover:bg-muted",
-                            )}
-                            title={hasTool ? "工具调用已启用，点击关闭" : "点击启用工具调用能力"}
-                          >
-                            工具
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(event) => { event.preventDefault(); toggleModelAbility(model.modelId, "REASONING", !hasReasoning); }}
-                            className={cn(
-                              "h-7 rounded-md border px-2 text-xs transition",
-                              hasReasoning
-                                ? "border-sky-500/50 bg-sky-500/10 text-sky-700 dark:text-sky-300"
-                                : "border-border text-muted-foreground hover:bg-muted",
-                            )}
-                            title={hasReasoning ? "推理已启用，点击关闭" : "点击启用推理能力"}
-                          >
-                            推理
-                          </button>
-                        </>
-                      ) : null}
-                      <Select value={currentType} onValueChange={(value) => updateModelType(model.modelId, value as "CHAT" | "IMAGE" | "EMBEDDING")}>
-                        <SelectTrigger className="h-8 w-28" onClick={(event) => event.preventDefault()}>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="CHAT">聊天</SelectItem>
-                          <SelectItem value="IMAGE">图像生成</SelectItem>
-                          <SelectItem value="EMBEDDING">嵌入</SelectItem>
-                        </SelectContent>
-                      </Select>
+                      <button
+                        type="button"
+                        onClick={(event) => { event.stopPropagation(); event.preventDefault(); toggleModelAbility(model.modelId, "TOOL", !hasTool); }}
+                        className={cn(
+                          "h-7 rounded-md border px-2 text-xs transition",
+                          hasTool
+                            ? "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                            : "border-border text-muted-foreground hover:bg-muted",
+                        )}
+                        title={hasTool ? "工具调用已启用，点击关闭" : "点击启用工具调用能力"}
+                      >
+                        工具
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => { event.stopPropagation(); event.preventDefault(); toggleModelAbility(model.modelId, "REASONING", !hasReasoning); }}
+                        className={cn(
+                          "h-7 rounded-md border px-2 text-xs transition",
+                          hasReasoning
+                            ? "border-sky-500/50 bg-sky-500/10 text-sky-700 dark:text-sky-300"
+                            : "border-border text-muted-foreground hover:bg-muted",
+                        )}
+                        title={hasReasoning ? "推理已启用，点击关闭" : "点击启用推理能力"}
+                      >
+                        推理
+                      </button>
                     </div>
                   ) : null}
-                </label>
+                </div>
                 );
               })}
               {!fetchedModels.length && !(draft.models ?? []).length ? (
-                <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">还没有模型。请先点击“获取模型列表”。</div>
+                <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">还没有模型。点击「添加模型」手动添加，或点击「获取模型列表」从上游同步。</div>
               ) : null}
             </div>
           </div>
@@ -1504,6 +1609,17 @@ function ProvidersSection({ settings, onSettings }: { settings: Settings; onSett
           {balanceResult ? <pre className="max-h-56 overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap">{balanceResult}</pre> : null}
         </div>
       </div>
+      {modelDialog ? (
+        <ModelEditDialog
+          open={Boolean(modelDialog)}
+          onOpenChange={(open) => { if (!open) setModelDialog(null); }}
+          mode={modelDialog.mode}
+          modelIdLocked={modelDialog.modelIdLocked}
+          initialModel={modelDialog.model}
+          onSave={handleModelDialogSave}
+          onDelete={modelDialog.mode === "edit" ? handleModelDialogDelete : undefined}
+        />
+      ) : null}
     </>
   );
 }
@@ -4393,11 +4509,21 @@ function DataSection({ settings, onSettings }: { settings: Settings; onSettings:
 
     setImporting(true);
     try {
-      const text = await file.text();
-      const backup = JSON.parse(text) as unknown;
-      const result = await api.post<{ status: string; settings: Settings }>("data/import", backup);
+      const formData = new FormData();
+      formData.append("file", file, file.name);
+      const result = await api.postMultipart<{
+        status: string;
+        source?: string;
+        summary?: string[];
+        settings: Settings;
+      }>("data/import", formData);
       onSettings(result.settings);
-      toast.success("备份已导入");
+      if (result.source === "android-zip") {
+        const lines = (result.summary ?? []).filter(Boolean);
+        toast.success(lines.length ? `已从 Android 备份导入：${lines.join("；")}` : "已从 Android 备份导入");
+      } else {
+        toast.success("备份已导入");
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "导入失败");
     } finally {
@@ -4411,7 +4537,7 @@ function DataSection({ settings, onSettings }: { settings: Settings; onSettings:
       <div className="grid gap-4 md:grid-cols-2">
         <div className="rounded-lg border bg-card p-4">
           <div className="text-sm font-medium">数据备份</div>
-          <div className="mt-1 text-xs text-muted-foreground">导出或导入本地 JSON 状态，包含设置、会话、文件索引和请求日志。</div>
+          <div className="mt-1 text-xs text-muted-foreground">导出或导入本地 JSON 状态，包含设置、会话、文件索引和请求日志。导入也兼容 Android 端导出的 .zip 备份（设置/附件/Skills，对话历史除外）。</div>
           <div className="mt-4 flex flex-wrap gap-2">
             <Button variant="outline" onClick={() => void exportData()} disabled={exporting}>
               {exporting ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
@@ -4421,7 +4547,7 @@ function DataSection({ settings, onSettings }: { settings: Settings; onSettings:
               {importing ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
               导入备份
             </Button>
-            <input ref={importInputRef} className="sr-only" type="file" accept="application/json,.json" onChange={(event) => void importData(event)} />
+            <input ref={importInputRef} className="sr-only" type="file" accept="application/json,.json,application/zip,.zip" onChange={(event) => void importData(event)} />
           </div>
         </div>
         <div className="rounded-lg border bg-card p-4">
@@ -4896,12 +5022,83 @@ function ProxySection({ settings, onSettings }: { settings: Settings; onSettings
 }
 
 function AboutSection() {
+  // Hard-coded current version — must match pc-server/server.ts:APP_VERSION and
+  // web-ui/src-tauri/tauri.conf.json:version. The update checker compares this against
+  // the latest GitHub release.
+  const APP_VERSION = "1.0.1";
+
+  type UpdateInfo = {
+    current: string;
+    latest: string;
+    isNewer: boolean;
+    title: string;
+    notes: string;
+    htmlUrl: string;
+    downloadUrl: string;
+    fileName: string;
+    size: number;
+  };
+
+  const [checking, setChecking] = React.useState(false);
+  const [updateInfo, setUpdateInfo] = React.useState<UpdateInfo | null>(null);
+  const [downloading, setDownloading] = React.useState(false);
+  const [installerPath, setInstallerPath] = React.useState<string | null>(null);
+  const [installerLaunching, setInstallerLaunching] = React.useState(false);
+
+  const checkForUpdate = async () => {
+    setChecking(true);
+    try {
+      const info = await api.get<UpdateInfo>("update/check");
+      // Always open the modal so the user gets feedback either way (newer / up-to-date).
+      setUpdateInfo(info);
+      setInstallerPath(null);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "检查更新失败");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const downloadAndInstall = async () => {
+    if (!updateInfo || !updateInfo.downloadUrl) return;
+    setDownloading(true);
+    try {
+      const result = await api.post<{ status: string; path: string; size: number }>("update/download", {
+        url: updateInfo.downloadUrl,
+        fileName: updateInfo.fileName,
+      });
+      setInstallerPath(result.path);
+      toast.success("下载完成，准备启动安装");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "下载失败");
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const launchAndExit = async () => {
+    if (!installerPath) return;
+    setInstallerLaunching(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("launch_installer", { path: installerPath });
+      toast.success("安装程序已启动，应用即将退出");
+      // Give the installer a moment to come up before we exit so the user sees both windows.
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      const { exit } = await import("@tauri-apps/plugin-process");
+      await exit(0);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "启动安装程序失败");
+      setInstallerLaunching(false);
+    }
+  };
+
   const aboutRows = [
-    { label: "版本", value: "1.0.0", icon: Settings2, onClick: undefined },
-    { label: "系统", value: typeof navigator === "undefined" ? "Windows / Web" : navigator.userAgent, icon: Smartphone, onClick: undefined },
-    { label: "官网", value: "https://rikka-ai.com", icon: Globe, onClick: () => void openExternal("https://rikka-ai.com/") },
-    { label: "GitHub", value: "https://github.com/yuh-G/rikkahub-pc", icon: Github, onClick: () => void openExternal("https://github.com/yuh-G/rikkahub-pc") },
-    { label: "License", value: "https://github.com/yuh-G/rikkahub-pc/blob/master/LICENSE", icon: FileClock, onClick: () => void openExternal("https://github.com/yuh-G/rikkahub-pc/blob/master/LICENSE") },
+    { label: "版本", value: APP_VERSION, icon: Settings2, onClick: undefined, action: "update" as const },
+    { label: "系统", value: typeof navigator === "undefined" ? "Windows / Web" : navigator.userAgent, icon: Smartphone, onClick: undefined, action: undefined },
+    { label: "官网", value: "https://rikka-ai.com", icon: Globe, onClick: () => void openExternal("https://rikka-ai.com/"), action: undefined },
+    { label: "GitHub", value: "https://github.com/yuh-G/rikkahub-pc", icon: Github, onClick: () => void openExternal("https://github.com/yuh-G/rikkahub-pc"), action: undefined },
+    { label: "License", value: "https://github.com/yuh-G/rikkahub-pc/blob/master/LICENSE", icon: FileClock, onClick: () => void openExternal("https://github.com/yuh-G/rikkahub-pc/blob/master/LICENSE"), action: undefined },
   ];
   return (
     <>
@@ -4926,7 +5123,21 @@ function AboutSection() {
                 </div>
                 <div className="flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
                   <span className="truncate">{row.value}</span>
-                  {row.onClick ? <ExternalLink className="size-3.5 shrink-0" /> : null}
+                  {row.action === "update" ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="ml-2 shrink-0"
+                      onClick={(event) => { event.stopPropagation(); void checkForUpdate(); }}
+                      disabled={checking}
+                    >
+                      {checking ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+                      检查更新
+                    </Button>
+                  ) : row.onClick ? (
+                    <ExternalLink className="size-3.5 shrink-0" />
+                  ) : null}
                 </div>
               </>
             );
@@ -4947,6 +5158,60 @@ function AboutSection() {
           })}
         </div>
       </div>
+      <Dialog open={updateInfo !== null} onOpenChange={(open) => { if (!open) { setUpdateInfo(null); setInstallerPath(null); } }}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>
+              {updateInfo?.isNewer ? "发现新版本" : "当前已是最新版本"}
+            </DialogTitle>
+            <DialogDescription>
+              {updateInfo?.isNewer
+                ? `当前版本 ${updateInfo.current} → 最新版本 ${updateInfo.latest}`
+                : `当前 ${updateInfo?.current ?? APP_VERSION}，已是最新（${updateInfo?.latest || "未知"}）。`}
+            </DialogDescription>
+          </DialogHeader>
+          {updateInfo?.notes ? (
+            <div className="rounded-md border bg-muted/30 p-3">
+              <div className="mb-1 text-xs font-medium text-muted-foreground">更新说明</div>
+              <pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground">{updateInfo.notes}</pre>
+            </div>
+          ) : null}
+          {installerPath ? (
+            <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs text-emerald-700 dark:text-emerald-300">
+              安装包已下载到本地：<code className="font-mono">{installerPath}</code>
+              <br />
+              点击下方"启动安装并退出"会启动 NSIS 安装程序并自动退出 Rikkahub，安装过程会保留你的数据目录和配置。
+            </div>
+          ) : null}
+          <DialogFooter>
+            {!updateInfo?.isNewer ? (
+              <Button type="button" onClick={() => { setUpdateInfo(null); setInstallerPath(null); }}>
+                我知道了
+              </Button>
+            ) : !installerPath ? (
+              <>
+                <Button type="button" variant="outline" onClick={() => { setUpdateInfo(null); setInstallerPath(null); }}>
+                  稍后再说
+                </Button>
+                <Button type="button" onClick={() => void downloadAndInstall()} disabled={downloading || !updateInfo?.downloadUrl}>
+                  {downloading ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
+                  {downloading ? "下载中…" : "下载安装包"}
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button type="button" variant="outline" onClick={() => { setUpdateInfo(null); setInstallerPath(null); }}>
+                  稍后再安装
+                </Button>
+                <Button type="button" onClick={() => void launchAndExit()} disabled={installerLaunching}>
+                  {installerLaunching ? <Loader2 className="size-4 animate-spin" /> : null}
+                  启动安装并退出
+                </Button>
+              </>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

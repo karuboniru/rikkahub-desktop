@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import { dirname, extname, join, resolve } from "node:path";
 import process from "node:process";
 import { gunzipSync, gzipSync, inflateRawSync } from "node:zlib";
+import { Database } from "bun:sqlite";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -375,6 +376,33 @@ const dataDir = resolve(process.env.RIKKAHUB_PC_DATA_DIR ?? join(rootDir, "pc-da
 const filesDir = join(dataDir, "files");
 const skillsDir = join(dataDir, "skills");
 const statePath = join(dataDir, "state.json");
+
+// MUST be kept in sync with web-ui/src-tauri/tauri.conf.json's `version` field. The update
+// checker compares this against the latest GitHub release tag and the version is also shown
+// verbatim in the About page. If you bump tauri.conf.json's version, bump this too.
+const APP_VERSION = "1.0.1";
+
+/** Compare two dotted-version strings. Returns -1/0/1 like `a - b`. Tolerates "v" prefix,
+ *  missing patch parts (treated as 0), and non-numeric trailing labels (compared as strings). */
+function compareSemver(a: string, b: string): number {
+  const norm = (v: string) => v.replace(/^v/i, "").trim();
+  const partsA = norm(a).split(".");
+  const partsB = norm(b).split(".");
+  const len = Math.max(partsA.length, partsB.length);
+  for (let i = 0; i < len; i++) {
+    const ap = partsA[i] ?? "0";
+    const bp = partsB[i] ?? "0";
+    const an = Number.parseInt(ap, 10);
+    const bn = Number.parseInt(bp, 10);
+    if (Number.isFinite(an) && Number.isFinite(bn) && String(an) === ap && String(bn) === bp) {
+      if (an !== bn) return an > bn ? 1 : -1;
+    } else {
+      const cmp = ap.localeCompare(bp);
+      if (cmp !== 0) return cmp > 0 ? 1 : -1;
+    }
+  }
+  return 0;
+}
 
 function id() {
   return crypto.randomUUID();
@@ -2223,6 +2251,314 @@ function applyBackupPayload(body: { state?: Partial<State>; skills?: unknown; fi
   saveState();
   broadcastSettings();
   broadcastList();
+}
+
+/**
+ * Try to import an Android-format backup ZIP. The Android client (v2.x) produces a ZIP
+ * containing `settings.json` + Room database files + `upload/` + `skills/`. PC and Android
+ * use different storage layouts (PC: JSON state.json; Android: SQLite via Room), so we can't
+ * literally restore the .db files. Instead we cherry-pick the cross-platform-portable bits:
+ *
+ *   ✓ settings.json → merged into PC settings (providers, search services, assistants,
+ *     mode injections, lorebooks, quick messages, display preferences, etc.)
+ *   ✓ upload/<file> → copied verbatim into pc-data/files/ and registered in state.files[]
+ *     so they're available as attachments by their old filenames
+ *   ✓ skills/<...> → copied into pc-data/skills/ so Agent Skills survive the migration
+ *   ✗ rikka_hub.db / -wal / -shm → SKIPPED. Reading Room SQLite would require duplicating
+ *     Android's schema mapping; conversation history therefore doesn't migrate. The summary
+ *     returned to the UI lists what was and wasn't recovered so the user understands.
+ *
+ * Uses PowerShell's Expand-Archive (ships on every supported Windows) to extract — no
+ * extra dependency in the compiled exe.
+ */
+function applyAndroidZipBackup(zipBuffer: Buffer): { settingsImported: boolean; filesImported: number; skillsImported: number; conversationsImported: number; dbReadError: string | null } {
+  const tmpRoot = join(dataDir, ".import-tmp");
+  rmSync(tmpRoot, { recursive: true, force: true });
+  mkdirSync(tmpRoot, { recursive: true });
+  const zipPath = join(tmpRoot, "backup.zip");
+  writeFileSync(zipPath, zipBuffer);
+  const extractDir = join(tmpRoot, "extracted");
+  mkdirSync(extractDir, { recursive: true });
+  // PowerShell quoting on Windows is finicky; use simple paths under our temp dir.
+  const script = `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`;
+  const proc = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]);
+  if (proc.exitCode !== 0) {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    throw new Error(`Failed to extract Android backup zip: ${new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 300)}`);
+  }
+
+  let settingsImported = false;
+  let filesImported = 0;
+  let skillsImported = 0;
+  let conversationsImported = 0;
+  let dbReadError: string | null = null;
+
+  const settingsPath = join(extractDir, "settings.json");
+  if (existsSync(settingsPath)) {
+    try {
+      const raw = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+      // Android Settings → PC Settings field mapping. Most field names line up because PC
+      // mirrors the Android model; the few that don't (e.g. some camelCase variants) fall
+      // through normalizeState's defaults. The spread also carries through unknown keys
+      // (mcpServers, modeInjections, lorebooks, quickMessages) since TS types are erased at
+      // runtime, so those settings round-trip without explicit mapping.
+      state = normalizeState({ ...state, settings: { ...state.settings, ...raw } as State["settings"] });
+      settingsImported = true;
+    } catch (err) {
+      console.warn("[import] failed to parse Android settings.json", err);
+    }
+  }
+
+  // Copy upload/ files into pc-data/files/ with fresh ids and register them in state.files.
+  // We do this BEFORE importing conversations so that the filename→PC-file-id map is
+  // available when rewriting `file://…/upload/<uuid>.png` URLs embedded in message parts —
+  // without that rewrite, the imported messages would all show "Failed to load image"
+  // because the on-disk file was renamed from `<uuid>.png` to `<numeric-id>.png`.
+  const androidFilenameToPcId = new Map<string, number>();
+  const uploadDir = join(extractDir, "upload");
+  if (existsSync(uploadDir)) {
+    mkdirSync(filesDir, { recursive: true });
+    for (const entry of readdirSync(uploadDir)) {
+      const srcPath = join(uploadDir, entry);
+      const stats = statSync(srcPath);
+      if (!stats.isFile()) continue;
+      const fileId = state.nextFileId++;
+      const ext = extname(entry) || "";
+      const targetName = `${fileId}${ext}`;
+      const targetPath = join(filesDir, targetName);
+      writeFileSync(targetPath, readFileSync(srcPath));
+      state.files.push({
+        id: fileId,
+        path: targetPath,
+        fileName: entry,
+        mime: guessMimeFromExt(ext),
+        size: stats.size,
+      });
+      androidFilenameToPcId.set(entry, fileId);
+      filesImported += 1;
+    }
+  }
+
+  // Conversation history: Android stores them in a Room SQLite db (`rikka_hub.db`) with two
+  // tables — ConversationEntity for metadata + message_node for the per-node messages array.
+  // We open the file via Bun's native SQLite and rebuild PC's Conversation[] shape, which
+  // happens to be a near-1:1 mapping because both sides serialize messages with the same
+  // kotlinx.serialization-compatible JSON format. The filename map built from upload/ is
+  // passed in so we can rewrite `file://…/upload/<uuid>.png` refs to `/api/files/<id>/content`.
+  const dbPath = join(extractDir, "rikka_hub.db");
+  if (existsSync(dbPath)) {
+    try {
+      conversationsImported = importAndroidConversations(extractDir, dbPath, androidFilenameToPcId);
+    } catch (err) {
+      dbReadError = err instanceof Error ? err.message : String(err);
+      console.warn("[import] failed to read Android SQLite database:", dbReadError);
+    }
+  }
+
+  // skills/ — copy the directory tree verbatim into pc-data/skills/.
+  const skillsSrc = join(extractDir, "skills");
+  if (existsSync(skillsSrc) && skillsDir) {
+    mkdirSync(skillsDir, { recursive: true });
+    skillsImported = copyDirRecursive(skillsSrc, skillsDir);
+  }
+
+  saveState();
+  broadcastSettings();
+  broadcastList();
+
+  rmSync(tmpRoot, { recursive: true, force: true });
+  return { settingsImported, filesImported, skillsImported, conversationsImported, dbReadError };
+}
+
+/**
+ * Reads `rikka_hub.db` (Android Room) and reconstructs PC `Conversation[]` entries by
+ * joining ConversationEntity with message_node (ordered by node_index). Returns the count
+ * of imported conversations.
+ *
+ * Conversations are merged into `state.conversations` by id — Android UUIDs effectively
+ * never collide with PC-generated ones, so this is functionally an append. If the user
+ * imports the same backup twice the second import overwrites prior copies (idempotent).
+ *
+ * The Android-side `messages` column is JSON `List<UIMessage>` serialized by kotlinx, which
+ * matches PC's `Message` shape directly (role enum, parts/annotations/usage as JsonValue
+ * passthroughs, ISO-string timestamps). We do shape-coercion as a defensive pass — bad rows
+ * are skipped, not thrown, so a single corrupt node doesn't lose the rest of the history.
+ */
+function importAndroidConversations(extractDir: string, dbPath: string, androidFilenameToPcId: Map<string, number>): number {
+  // SQLite resolves WAL siblings as `${dbfile}-wal` / `${dbfile}-shm`, but Android exports
+  // them with the original (extension-less) database name `rikka_hub-wal` / `rikka_hub-shm`.
+  // Without renaming, any uncommitted writes still sitting in the WAL are silently ignored.
+  for (const [src, dest] of [
+    ["rikka_hub-wal", "rikka_hub.db-wal"],
+    ["rikka_hub-shm", "rikka_hub.db-shm"],
+  ]) {
+    const s = join(extractDir, src);
+    const d = join(extractDir, dest);
+    if (existsSync(s) && !existsSync(d)) {
+      try { renameSync(s, d); } catch (err) { console.warn(`[import] WAL rename failed: ${err}`); }
+    }
+  }
+
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    // Use dynamic column access (SELECT *) so we don't blow up on older Android schemas
+    // missing a column. Defaults are applied per-field below.
+    const convRows = db.query("SELECT * FROM ConversationEntity").all() as Record<string, unknown>[];
+    const nodeStmt = db.query("SELECT * FROM message_node WHERE conversation_id = ? ORDER BY node_index ASC");
+
+    let imported = 0;
+    const existingById = new Map(state.conversations.map((conv) => [conv.id, conv]));
+
+    for (const row of convRows) {
+      const convId = String(row.id ?? "");
+      if (!convId) continue;
+
+      const nodeRows = nodeStmt.all(convId) as Record<string, unknown>[];
+      const messageNodes: MessageNode[] = nodeRows.map((node) => {
+        const rawMessages = typeof node.messages === "string" ? node.messages : "[]";
+        let parsed: unknown[] = [];
+        try {
+          const decoded = JSON.parse(rawMessages);
+          if (Array.isArray(decoded)) parsed = decoded;
+        } catch {
+          parsed = [];
+        }
+        const messages: Message[] = parsed
+          .map(normalizeAndroidMessage)
+          .filter((m): m is Message => m !== null)
+          .map((m) => ({
+            ...m,
+            // Walk parts deeply and rewrite any Android upload paths into PC file refs. Done
+            // per-message so a corrupted node only affects itself, not the whole conversation.
+            parts: rewriteAndroidFileUrlsDeep(m.parts, androidFilenameToPcId) as JsonValue[],
+          }));
+        return {
+          id: String(node.id ?? Bun.randomUUIDv7()),
+          messages,
+          selectIndex: typeof node.select_index === "number" ? node.select_index : 0,
+        };
+      });
+
+      let chatSuggestions: string[] = [];
+      try {
+        const decoded = JSON.parse(typeof row.suggestions === "string" ? row.suggestions : "[]");
+        if (Array.isArray(decoded)) chatSuggestions = decoded.filter((x): x is string => typeof x === "string");
+      } catch { /* keep empty */ }
+
+      const conv: Conversation = {
+        id: convId,
+        assistantId: String(row.assistant_id ?? DEFAULT_ASSISTANT_ID) || DEFAULT_ASSISTANT_ID,
+        systemPrompt: row.custom_system_prompt ? String(row.custom_system_prompt) : null,
+        title: String(row.title ?? ""),
+        messages: messageNodes,
+        truncateIndex: 0, // No Android equivalent — start unindented.
+        chatSuggestions,
+        isPinned: row.is_pinned === 1 || row.is_pinned === true,
+        createAt: Number(row.create_at ?? Date.now()),
+        updateAt: Number(row.update_at ?? Date.now()),
+      };
+
+      existingById.set(conv.id, conv);
+      imported += 1;
+    }
+
+    // Re-sort by updateAt desc so the imported conversations land in the natural "most
+    // recent first" order alongside any PC-side conversations the user already had.
+    state.conversations = Array.from(existingById.values()).sort((a, b) => b.updateAt - a.updateAt);
+    return imported;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Deep-walk a JsonValue rewriting any string that matches Android's upload URL pattern
+ * (`file:///…/upload/<filename>` or just `…/upload/<filename>`) into PC's
+ * `/api/files/<id>/content` form, using the filename→pcFileId map built during the upload
+ * folder copy.
+ *
+ * Conservative — only matches the literal segment `upload/<filename>` and only rewrites
+ * when the filename is in our map. URLs we don't recognize pass through untouched, so
+ * tool-output JSON with arbitrary http/https URLs is unaffected.
+ */
+function rewriteAndroidFileUrlsDeep(value: JsonValue, map: Map<string, number>): JsonValue {
+  if (typeof value === "string") {
+    return rewriteAndroidFileUrl(value, map);
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => rewriteAndroidFileUrlsDeep(v, map));
+  }
+  if (value && typeof value === "object") {
+    const result: Record<string, JsonValue> = {};
+    for (const [k, v] of Object.entries(value)) {
+      result[k] = rewriteAndroidFileUrlsDeep(v as JsonValue, map);
+    }
+    return result;
+  }
+  return value;
+}
+
+function rewriteAndroidFileUrl(url: string, map: Map<string, number>): string {
+  // Match the last `upload/<filename>` segment. Android URI is `file:///data/.../files/upload/<uuid>.<ext>`;
+  // we strip everything up to and including the final `upload/` and use the trailing name.
+  const match = url.match(/(?:^|[/\\])upload[/\\]([^/\\?#]+)/);
+  if (!match) return url;
+  const filename = match[1];
+  const pcId = map.get(filename);
+  if (pcId === undefined) return url;
+  return `/api/files/${pcId}/content`;
+}
+
+/**
+ * Defensive shape-coercion from Android UIMessage JSON to PC Message. Bad rows return null
+ * (caller filters). Role enum is whitelisted to PC's 4 known values; anything else falls
+ * back to "USER" rather than producing an unrecognized role.
+ */
+function normalizeAndroidMessage(raw: unknown): Message | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const role = typeof r.role === "string" ? r.role.toUpperCase() : "USER";
+  const allowedRoles: Message["role"][] = ["USER", "ASSISTANT", "SYSTEM", "TOOL"];
+  const mappedRole: Message["role"] = (allowedRoles as string[]).includes(role)
+    ? (role as Message["role"])
+    : "USER";
+  return {
+    id: typeof r.id === "string" ? r.id : Bun.randomUUIDv7(),
+    role: mappedRole,
+    parts: Array.isArray(r.parts) ? (r.parts as JsonValue[]) : [],
+    annotations: Array.isArray(r.annotations) ? (r.annotations as JsonValue[]) : [],
+    createdAt: typeof r.createdAt === "string" ? r.createdAt : new Date().toISOString(),
+    finishedAt: typeof r.finishedAt === "string" ? r.finishedAt : null,
+    modelId: typeof r.modelId === "string" ? r.modelId : null,
+    usage: (r.usage ?? null) as JsonValue | null,
+    translation: typeof r.translation === "string" ? r.translation : null,
+  };
+}
+
+function guessMimeFromExt(ext: string): string {
+  const e = ext.toLowerCase().replace(/^\./, "");
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(e)) return `image/${e === "jpg" ? "jpeg" : e}`;
+  if (e === "pdf") return "application/pdf";
+  if (e === "docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (e === "txt" || e === "md") return "text/plain";
+  return "application/octet-stream";
+}
+
+function copyDirRecursive(src: string, dest: string): number {
+  let count = 0;
+  for (const entry of readdirSync(src)) {
+    const srcPath = join(src, entry);
+    const destPath = join(dest, entry);
+    const stats = statSync(srcPath);
+    if (stats.isDirectory()) {
+      mkdirSync(destPath, { recursive: true });
+      count += copyDirRecursive(srcPath, destPath);
+    } else {
+      writeFileSync(destPath, readFileSync(srcPath));
+      count += 1;
+    }
+  }
+  return count;
 }
 
 function webDavAuthHeader(config: WebDavConfig) {
@@ -10416,13 +10752,121 @@ async function routeApi(request: Request, url: URL) {
     });
   }
   if (path === "data/import" && request.method === "POST") {
-    const body = await readJson<{ state?: Partial<State>; skills?: unknown } & Partial<State>>(request);
+    // Two-format compatibility: PC's own export is a JSON document, while the Android client
+    // exports a ZIP (settings.json + Room SQLite + upload/ + skills/). We accept the file as
+    // a multipart upload and route by the first 4 magic bytes — `PK\x03\x04` → ZIP, anything
+    // else → text → JSON.parse.
     try {
+      const form = await request.formData();
+      const file = form.get("file");
+      if (!(file instanceof File)) return error("No backup file uploaded", 400);
+      const buffer = Buffer.from(await file.arrayBuffer());
+      const isZip = buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4B && buffer[2] === 0x03 && buffer[3] === 0x04;
+      if (isZip) {
+        const summary = applyAndroidZipBackup(buffer);
+        const messages = [
+          summary.settingsImported ? "已恢复设置（供应商、助手、搜索服务、MCP、提示注入、世界书、快捷消息）" : "未发现可恢复的设置文件",
+          summary.conversationsImported ? `已恢复 ${summary.conversationsImported} 条对话历史` : "",
+          summary.filesImported ? `已恢复 ${summary.filesImported} 个附件` : "",
+          summary.skillsImported ? `已恢复 ${summary.skillsImported} 个 Skill 文件` : "",
+          summary.dbReadError ? `对话历史导入失败：${summary.dbReadError}` : "",
+        ].filter(Boolean);
+        return json({ status: "imported", source: "android-zip", summary: messages, settings: state.settings });
+      }
+      const text = buffer.toString("utf-8");
+      const body = JSON.parse(text) as { state?: Partial<State>; skills?: unknown } & Partial<State>;
       applyBackupPayload(body);
-    } catch {
-      return error("Invalid backup file", 400);
+      return json({ status: "imported", source: "pc-json", settings: state.settings });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : "Invalid backup file", 400);
     }
-    return json({ status: "imported", settings: state.settings });
+  }
+
+  // -- Update check / download ---------------------------------------------------
+  // Queries GitHub Releases for the latest published release of the PC repo, compares its
+  // tag (e.g. "v1.0.1") to APP_VERSION, and returns the diff so the About page can decide
+  // whether to prompt the user. We don't poll automatically — only fires on user click.
+  // Unauthenticated GitHub API has a 60-req/hr/IP limit, which is fine for "click to check".
+  if (path === "update/check" && request.method === "GET") {
+    try {
+      const repo = "yuh-G/rikkahub-pc";
+      const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "RikkaHub-PC" },
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        return error(`GitHub ${res.status}: ${text.slice(0, 300)}`, 502);
+      }
+      const release = (await res.json()) as {
+        tag_name?: string;
+        name?: string;
+        body?: string;
+        html_url?: string;
+        assets?: { name?: string; browser_download_url?: string; size?: number }[];
+      };
+      const tag = (release.tag_name ?? "").replace(/^v/i, "");
+      // Find the Windows x64 NSIS installer asset by suffix matching. Format from tauri.conf:
+      // `Rikkahub_<version>_x64-setup.exe`. Fall back to the first .exe if nothing matches.
+      const assets = release.assets ?? [];
+      const installer =
+        assets.find((asset) => /x64[-_]setup\.exe$/i.test(asset.name ?? "")) ??
+        assets.find((asset) => /\.exe$/i.test(asset.name ?? ""));
+      const downloadUrl = installer?.browser_download_url ?? "";
+      const fileName = installer?.name ?? "";
+      const size = installer?.size ?? 0;
+      const isNewer = compareSemver(tag, APP_VERSION) > 0;
+      return json({
+        current: APP_VERSION,
+        latest: tag,
+        isNewer,
+        title: release.name ?? release.tag_name ?? "",
+        notes: release.body ?? "",
+        htmlUrl: release.html_url ?? `https://github.com/${repo}/releases/latest`,
+        downloadUrl,
+        fileName,
+        size,
+      });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : "Failed to check for updates", 502);
+    }
+  }
+  // Downloads a release asset to %TEMP%\rikkahub-updates and returns the local path. The UI
+  // then asks the Tauri shell to launch the installer; the user explicitly confirms exit so
+  // we don't race the installer's "close target app" check.
+  if (path === "update/download" && request.method === "POST") {
+    try {
+      const body = await readJson<{ url?: string; fileName?: string }>(request);
+      const url = String(body.url ?? "").trim();
+      if (!/^https:\/\//i.test(url)) return error("Invalid download URL", 400);
+      // Allow only GitHub-served hosts to limit blast radius if the URL ever came from elsewhere.
+      const host = (() => {
+        try {
+          return new URL(url).host.toLowerCase();
+        } catch {
+          return "";
+        }
+      })();
+      if (!/^(github\.com|.*\.githubusercontent\.com|objects\.githubusercontent\.com)$/i.test(host)) {
+        return error(`Refusing to download from non-GitHub host: ${host}`, 400);
+      }
+      const fileName = (String(body.fileName ?? "").replace(/[^A-Za-z0-9._\-]/g, "") || "rikkahub-update.exe");
+      const tmpDir = join(process.env.TEMP ?? process.env.TMP ?? dataDir, "rikkahub-updates");
+      mkdirSync(tmpDir, { recursive: true });
+      const targetPath = join(tmpDir, fileName);
+      const res = await fetch(url, {
+        redirect: "follow",
+        headers: { "User-Agent": "RikkaHub-PC" },
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        return error(`Download failed: ${res.status} ${text.slice(0, 200)}`, 502);
+      }
+      const buffer = Buffer.from(await res.arrayBuffer());
+      writeFileSync(targetPath, buffer);
+      return json({ status: "ok", path: targetPath, size: buffer.length });
+    } catch (err) {
+      return error(err instanceof Error ? err.message : "Download failed", 502);
+    }
   }
 
   if (path === "settings/asr-provider/detail" && request.method === "POST") {
@@ -10616,33 +11060,35 @@ const portEqualsArg = Bun.argv.find((arg) => arg.startsWith("--port="));
 const portValue = portEqualsArg?.split("=")[1] ?? (portIndex >= 0 ? Bun.argv[portIndex + 1] : undefined);
 const port = Number(portValue ?? process.env.PORT ?? "8080");
 
-const server = Bun.serve({
-  port,
-  idleTimeout: 0,
-  async fetch(request, server) {
-    server.timeout(request, 0);
-    const url = new URL(request.url);
-    try {
-      if (url.pathname === "/api/asr/realtime" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-        const upgraded = server.upgrade(request, { data: { kind: "asr" } });
-        return upgraded ? undefined : error("WebSocket upgrade failed", 400);
-      }
-      if (url.pathname.startsWith("/api/")) return await routeApi(request, url);
-      return await routeStatic(url);
-    } catch (err) {
-      console.error(err);
-      return error(err instanceof Error ? err.message : String(err), 500);
-    }
-  },
-  websocket: {
-    message(ws, data) {
-      if ((ws.data as { kind?: string } | undefined)?.kind !== "asr") return;
-      if (typeof data === "string") {
-        const payload = JSON.parse(data || "{}") as { type?: string; providerId?: string };
-        if (payload.type === "start") startAsrRealtimeSession(ws, payload.providerId);
-        if (payload.type === "stop") stopAsrRealtimeSession(ws);
-        return;
-      }
+const server = (() => {
+  try {
+    return Bun.serve({
+      port,
+      idleTimeout: 0,
+      async fetch(request, server) {
+        server.timeout(request, 0);
+        const url = new URL(request.url);
+        try {
+          if (url.pathname === "/api/asr/realtime" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+            const upgraded = server.upgrade(request, { data: { kind: "asr" } });
+            return upgraded ? undefined : error("WebSocket upgrade failed", 400);
+          }
+          if (url.pathname.startsWith("/api/")) return await routeApi(request, url);
+          return await routeStatic(url);
+        } catch (err) {
+          console.error(err);
+          return error(err instanceof Error ? err.message : String(err), 500);
+        }
+      },
+      websocket: {
+        message(ws, data) {
+          if ((ws.data as { kind?: string } | undefined)?.kind !== "asr") return;
+          if (typeof data === "string") {
+            const payload = JSON.parse(data || "{}") as { type?: string; providerId?: string };
+            if (payload.type === "start") startAsrRealtimeSession(ws, payload.providerId);
+            if (payload.type === "stop") stopAsrRealtimeSession(ws);
+            return;
+          }
       const session = asrRealtimeSessions.get(ws);
       if (!session) return;
       const buffer = data instanceof ArrayBuffer
@@ -10655,6 +11101,23 @@ const server = Bun.serve({
     },
   },
 });
+  } catch (err) {
+    // The most common failure here is EADDRINUSE — i.e. another Rikkahub instance (or some
+    // unrelated app) is already bound to this port. We print a clear, single-line marker that
+    // the Tauri shell's spawn-monitor parses out (`port_in_use:<port>`) so it can surface a
+    // user-friendly dialog instead of silently loading whatever stale orphan is on the port.
+    const message = err instanceof Error ? err.message : String(err);
+    if (/EADDRINUSE|address already in use|in use/i.test(message)) {
+      console.error(`[rikkahub-server] port_in_use:${port}`);
+      console.error(
+        `Port ${port} is already in use. Another Rikkahub instance may still be running — close it from Task Manager and try again.`,
+      );
+      process.exit(2);
+    }
+    console.error(`[rikkahub-server] Failed to start on port ${port}: ${message}`);
+    process.exit(1);
+  }
+})();
 
 console.log(`RikkaHub PC server running at http://localhost:${port}`);
 console.log(`Data directory: ${dataDir}`);

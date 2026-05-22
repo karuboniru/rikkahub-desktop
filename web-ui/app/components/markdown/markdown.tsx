@@ -67,6 +67,12 @@ type MarkdownProps = {
   content: string;
   className?: string;
   onClickCitation?: (id: string) => void;
+  /**
+   * Optional map of citation id → 1-based display ordinal. When set, `[citation,domain](id)`
+   * badges show the ordinal (e.g. `[1]`) instead of the raw id (e.g. `8905cd`). Built by
+   * the message renderer from the message's annotations + search tool outputs.
+   */
+  citationOrdinalMap?: Map<string, number>;
   allowCodePreview?: boolean;
   isAnimating?: boolean;
 };
@@ -85,6 +91,7 @@ export default function Markdown({
   content,
   className,
   onClickCitation,
+  citationOrdinalMap,
   allowCodePreview = true,
   isAnimating = false,
 }: MarkdownProps) {
@@ -161,7 +168,11 @@ export default function Markdown({
             if (childText.startsWith("citation,")) {
               const domain = childText.substring("citation,".length);
               const id = (href || "").trim().replace(/^s/i, "");
-              const displayId = id.replace(/^s/i, "");
+              // Prefer the ordinal (1-based position) from the message's annotation/tool-output
+              // list — that's the user-facing "[1]" / "[2]" label they expect. Falls back to
+              // the raw id (e.g. Android's 6-char hex `8905cd`) if no mapping is available.
+              const ordinal = citationOrdinalMap?.get(id);
+              const displayId = ordinal !== undefined ? String(ordinal) : id.replace(/^s/i, "");
 
               if (id && onClickCitation) {
                 return (

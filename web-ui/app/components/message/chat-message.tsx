@@ -298,6 +298,66 @@ function buildCitationUrlMap(parts: UIMessagePart[], annotations?: UIMessageAnno
   return map;
 }
 
+/**
+ * Maps citation identifiers (the value inside `[citation,domain](id)` Markdown links) to a
+ * 1-based display ordinal. Both Android's search tool and PC's `search_web` tool tag each
+ * source with an opaque id (Android uses a 6-char hex prefix; PC uses index-or-id). The
+ * raw id is meaningless to users — they expect "[1] [2] [3]" — so the Markdown renderer
+ * uses this map to substitute the badge label.
+ *
+ * Built in two passes (annotations first, then tool outputs) so an explicit
+ * `url_citation` annotation takes precedence over the same source appearing inside a tool
+ * result. A single ordinal is reused if the same id shows up multiple times.
+ */
+function buildCitationOrdinalMap(parts: UIMessagePart[], annotations?: UIMessageAnnotation[]): Map<string, number> {
+  const map = new Map<string, number>();
+  let nextOrdinal = 1;
+  const assign = (key: string) => {
+    const trimmed = key.trim();
+    if (!trimmed || map.has(trimmed)) return;
+    map.set(trimmed, nextOrdinal++);
+  };
+
+  annotations
+    ?.filter((annotation) => annotation.type === "url_citation")
+    .forEach((annotation) => {
+      // Annotations themselves don't carry an id on either platform — they're addressed by
+      // position. We still register the numeric ordinal so `[citation,domain](1)` markers
+      // (the format PC's preProcess emits) resolve to themselves.
+      const idx = nextOrdinal;
+      assign(`${idx}`);
+      if (annotation.title) assign(annotation.title);
+    });
+
+  parts.forEach((part) => {
+    if (part.type !== "tool" || part.toolName !== "search_web") return;
+    const outputText = part.output
+      .filter((outputPart): outputPart is { type: "text"; text: string } => outputPart.type === "text")
+      .map((outputPart) => outputPart.text)
+      .join("\n");
+    const parsed = parseToolOutputJson(outputText);
+    if (!parsed || typeof parsed !== "object") return;
+    const items = (parsed as { items?: unknown }).items;
+    if (!Array.isArray(items)) return;
+
+    items.forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const id = String((item as { id?: unknown }).id ?? "").trim();
+      const title = String((item as { title?: unknown }).title ?? "").trim();
+      // The ordinal is assigned by registration order: each new item bumps the counter
+      // once via the first `assign` call; subsequent assigns for the same item's aliases
+      // (numeric position, title) hit the same ordinal because map.has gates the bump.
+      const ordinalForThisItem = nextOrdinal;
+      if (id) assign(id);
+      // Numeric alias so `[citation,domain](2)` (PC's preProcess format) still resolves.
+      assign(`${ordinalForThisItem}`);
+      if (title) assign(title);
+    });
+  });
+
+  return map;
+}
+
 const ChatMessageActionsRow = React.memo(({
   node,
   message,
@@ -742,6 +802,10 @@ export const ChatMessage = React.memo(({
     () => buildCitationUrlMap(message.parts, message.annotations),
     [message.annotations, message.parts],
   );
+  const citationOrdinalMap = React.useMemo(
+    () => buildCitationOrdinalMap(message.parts, message.annotations),
+    [message.annotations, message.parts],
+  );
   const handleClickCitation = React.useCallback(
     (citationId: string) => {
       const normalized = citationId.trim();
@@ -789,6 +853,7 @@ export const ChatMessage = React.memo(({
               role={message.role as "USER" | "ASSISTANT" | "SYSTEM" | "TOOL"}
               onToolApproval={onToolApproval}
               onClickCitation={handleClickCitation}
+              citationOrdinalMap={citationOrdinalMap}
             />
           </div>
         </div>
@@ -828,6 +893,7 @@ export const ChatMessage = React.memo(({
           content={message.translation}
           alignRight={isUser}
           onClickCitation={handleClickCitation}
+          citationOrdinalMap={citationOrdinalMap}
         />
       ) : null}
 
@@ -840,10 +906,12 @@ const TranslationBlock = React.memo(({
   content,
   alignRight,
   onClickCitation,
+  citationOrdinalMap,
 }: {
   content: string;
   alignRight: boolean;
   onClickCitation: (citationId: string) => void;
+  citationOrdinalMap?: Map<string, number>;
 }) => {
   const [collapsed, setCollapsed] = React.useState(false);
   const isLoading = content.trim() === "" || content.trim() === "正在翻译...";
@@ -880,7 +948,7 @@ const TranslationBlock = React.memo(({
             </div>
           ) : null}
           {content.trim() && content.trim() !== "正在翻译..." ? (
-            <Markdown content={content} className="message-markdown" onClickCitation={onClickCitation} />
+            <Markdown content={content} className="message-markdown" onClickCitation={onClickCitation} citationOrdinalMap={citationOrdinalMap} />
           ) : null}
         </div>
       )}

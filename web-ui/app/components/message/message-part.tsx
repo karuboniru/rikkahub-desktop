@@ -79,6 +79,7 @@ interface MessagePartsProps {
   role?: "USER" | "ASSISTANT" | "SYSTEM" | "TOOL";
   onToolApproval?: (toolCallId: string, approved: boolean, reason: string, answer?: string) => void | Promise<void>;
   onClickCitation?: (id: string) => void;
+  citationOrdinalMap?: Map<string, number>;
 }
 
 function renderContentPart(
@@ -88,10 +89,11 @@ function renderContentPart(
   onClickCitation?: (id: string) => void,
   assistant?: AssistantProfile | null,
   role?: "USER" | "ASSISTANT" | "SYSTEM" | "TOOL",
+  citationOrdinalMap?: Map<string, number>,
 ) {
   switch (part.type) {
     case "text":
-      return <TextPart text={applyAssistantRegexes(part.text, assistant, role === "USER" ? "USER" : "ASSISTANT", true)} isAnimating={loading} onClickCitation={onClickCitation} />;
+      return <TextPart text={applyAssistantRegexes(part.text, assistant, role === "USER" ? "USER" : "ASSISTANT", true)} isAnimating={loading} onClickCitation={onClickCitation} citationOrdinalMap={citationOrdinalMap} />;
     case "image":
       return <ImagePart url={part.url} metadata={part.metadata} />;
     case "video":
@@ -120,6 +122,7 @@ export const MessageParts = React.memo(({
   role,
   onToolApproval,
   onClickCitation,
+  citationOrdinalMap,
 }: MessagePartsProps) => {
   const { t } = useTranslation("message");
   const groupedParts = React.useMemo(() => groupMessageParts(parts), [parts]);
@@ -198,7 +201,7 @@ export const MessageParts = React.memo(({
 
         return (
           <React.Fragment key={`content-${block.index}`}>
-            {renderContentPart(block.part, t, loading, onClickCitation, assistant, role)}
+            {renderContentPart(block.part, t, loading, onClickCitation, assistant, role, citationOrdinalMap)}
           </React.Fragment>
         );
       })}
@@ -214,9 +217,10 @@ interface MessagePartProps {
   role?: "USER" | "ASSISTANT" | "SYSTEM" | "TOOL";
   onToolApproval?: (toolCallId: string, approved: boolean, reason: string, answer?: string) => void | Promise<void>;
   onClickCitation?: (id: string) => void;
+  citationOrdinalMap?: Map<string, number>;
 }
 
-export function MessagePart({ part, loading, assistant, role, onToolApproval, onClickCitation }: MessagePartProps) {
+export function MessagePart({ part, loading, assistant, role, onToolApproval, onClickCitation, citationOrdinalMap }: MessagePartProps) {
   return (
     <MessageParts
       parts={[part]}
@@ -225,6 +229,7 @@ export function MessagePart({ part, loading, assistant, role, onToolApproval, on
       role={role}
       onToolApproval={onToolApproval}
       onClickCitation={onClickCitation}
+      citationOrdinalMap={citationOrdinalMap}
     />
   );
 }

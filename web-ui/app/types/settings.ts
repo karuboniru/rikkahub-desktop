@@ -105,12 +105,32 @@ export interface McpServerConfig {
 }
 
 export type ModelType = "CHAT" | "IMAGE" | "EMBEDDING";
+// PC keeps the wider Modality list (AUDIO/VIDEO/DOCUMENT) for forward-compat with providers
+// that already accept those — Android only has TEXT/IMAGE today but we don't want PC to ship
+// narrower than the upstream API allows.
 export type ModelModality = "TEXT" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
 export type ModelAbility = "TOOL" | "REASONING";
 
+// Mirrors Android's `BuiltInTools` sealed class (`@SerialName("search" | "url_context" | "image_generation")`).
+// The string is the canonical id sent to the provider when invoking the tool.
+export type BuiltInToolType = "search" | "url_context" | "image_generation";
+
 export interface BuiltInTool {
-  type?: string;
+  type?: BuiltInToolType | string;
   [key: string]: unknown;
+}
+
+// Mirrors Android's `CustomHeader` (Provider.kt:103).
+export interface CustomHeader {
+  name: string;
+  value: string;
+}
+
+// Mirrors Android's `CustomBody` (Provider.kt:109). `value` is intentionally `unknown` because
+// the upstream stores a raw `JsonElement` — could be string, number, bool, object, or array.
+export interface CustomBody {
+  key: string;
+  value: unknown;
 }
 
 export interface ProviderModel {
@@ -122,6 +142,17 @@ export interface ProviderModel {
   outputModalities?: ModelModality[];
   abilities?: ModelAbility[];
   tools?: BuiltInTool[];
+  customHeaders?: CustomHeader[];
+  customBodies?: CustomBody[];
+  /**
+   * `true` for models added via the manual "+" dialog. Used to decide whether to lock the
+   * `modelId` field in the edit dialog: manually-added models keep editable IDs (the user
+   * owns them); models that came from `获取模型列表` have their ID locked because the value
+   * is sent verbatim to the upstream API and editing it would silently break request routing.
+   *
+   * Existing/back-compat models (no flag) are treated as fetched → locked.
+   */
+  manuallyAdded?: boolean;
   [key: string]: unknown;
 }
 

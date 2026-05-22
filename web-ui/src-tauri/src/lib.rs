@@ -11,7 +11,10 @@ use std::{
     fs,
     net::TcpStream,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -20,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
 };
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
@@ -97,25 +101,37 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Probe localhost:8080 until the sidecar accepts a connection or we time out.
-fn wait_for_sidecar_ready(timeout: Duration) -> bool {
+/// Probe localhost:8080 until the sidecar accepts a connection or we time out. Also
+/// short-circuits if the spawned child process died — this prevents the silent-orphan
+/// scenario where a separate Rikkahub instance owns the port, our spawn fails with
+/// EADDRINUSE and exits, but the TCP probe still succeeds because the orphan responds.
+fn wait_for_sidecar_ready(timeout: Duration, child_dead: &AtomicBool) -> Result<(), String> {
     let started = Instant::now();
     let addr = format!("127.0.0.1:{SIDECAR_PORT}");
     while started.elapsed() < timeout {
+        if child_dead.load(Ordering::Acquire) {
+            return Err(format!(
+                "Rikkahub 启动失败：端口 {SIDECAR_PORT} 已被占用。\n\n\
+                请打开任务管理器，关闭已有的 rikkahub-server.exe 或 rikkahub-pc.exe 进程，\
+                然后重新启动 Rikkahub。"
+            ));
+        }
         if TcpStream::connect_timeout(
             &addr.parse().expect("valid loopback addr"),
             Duration::from_millis(200),
         )
         .is_ok()
         {
-            return true;
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(150));
     }
-    false
+    Err(format!(
+        "Rikkahub 后端服务在 {SIDECAR_READY_TIMEOUT:?} 内未启动完成，请重试。"
+    ))
 }
 
-fn spawn_sidecar(app: &AppHandle) -> Result<CommandChild, String> {
+fn spawn_sidecar(app: &AppHandle) -> Result<(CommandChild, Arc<AtomicBool>), String> {
     let data_dir = resolve_data_dir(app);
     fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create data dir {}: {e}", data_dir.display()))?;
@@ -142,6 +158,12 @@ fn spawn_sidecar(app: &AppHandle) -> Result<CommandChild, String> {
     #[cfg(windows)]
     bind_to_kill_on_close_job(child.pid());
 
+    // Tracks whether the sidecar process terminated. Used by the readiness loop to detect
+    // the "another instance owns :8080, our spawn died on EADDRINUSE" failure mode, which
+    // otherwise looks like a successful start because the orphan responds to TCP probes.
+    let dead = Arc::new(AtomicBool::new(false));
+    let dead_clone = dead.clone();
+
     // Pipe sidecar stdout/stderr to the host stdout so `cargo tauri dev` users see logs.
     // In release this is silent because of the `windows_subsystem = "windows"` attribute.
     tauri::async_runtime::spawn(async move {
@@ -162,14 +184,17 @@ fn spawn_sidecar(app: &AppHandle) -> Result<CommandChild, String> {
                 }
                 CommandEvent::Terminated(payload) => {
                     eprintln!("[sidecar] terminated: {payload:?}");
+                    dead_clone.store(true, Ordering::Release);
                     break;
                 }
                 _ => {}
             }
         }
+        // Stream closed without an explicit Terminated event — treat as dead too.
+        dead_clone.store(true, Ordering::Release);
     });
 
-    Ok(child)
+    Ok((child, dead))
 }
 
 /// On Windows, putting the sidecar into a Job Object with `KILL_ON_JOB_CLOSE` ensures the OS
@@ -246,37 +271,104 @@ fn set_data_dir(app: AppHandle, path: String) -> Result<(), String> {
     save_user_config(&app, &cfg)
 }
 
+/// Launches an installer .exe as a detached process so our shell exiting doesn't take it
+/// down. Used by the in-app update flow: backend downloads the new installer to %TEMP%,
+/// frontend calls this to launch it, then the user is prompted to close Rikkahub so the
+/// NSIS installer's "close target app" check doesn't block.
+///
+/// We don't attach the child to the kill-on-close job object (that's only for the sidecar)
+/// and we drop the `Child` handle without `wait()` so the installer process is fully
+/// independent. After this returns Ok, the caller should immediately exit the app.
+#[tauri::command]
+fn launch_installer(path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Installer path is empty".to_string());
+    }
+    let installer_path = PathBuf::from(trimmed);
+    if !installer_path.exists() {
+        return Err(format!("Installer not found: {}", installer_path.display()));
+    }
+    // Sanity: only allow .exe so we don't accidentally run scripts the backend handed us.
+    let ext_ok = installer_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("exe"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err(format!("Refusing to launch non-exe: {}", installer_path.display()));
+    }
+    std::process::Command::new(&installer_path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to launch installer: {e}"))
+}
+
+/// Modal error dialog shown during startup when the sidecar can't come up. We use
+/// `blocking_show` so the user actually sees it before `app.exit()` tears the process down.
+fn show_startup_error(app: &AppHandle, message: &str) {
+    eprintln!("[startup-error] {message}");
+    app.dialog()
+        .message(message)
+        .kind(MessageDialogKind::Error)
+        .title("Rikkahub 启动失败")
+        .blocking_show();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance plugin: clicking the desktop shortcut while Rikkahub is already
+        // running just focuses the existing window instead of spawning a second shell whose
+        // sidecar would EADDRINUSE-die and leave the user with a broken titlebar (see the
+        // port-conflict scenario fixed in v1.0.1).
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_os::init())
         .manage(SidecarState::default())
-        .invoke_handler(tauri::generate_handler![get_data_dir, set_data_dir])
+        .invoke_handler(tauri::generate_handler![get_data_dir, set_data_dir, launch_installer])
         .setup(|app| {
             let handle = app.handle().clone();
 
             // Start the sidecar before the webview loads, then wait for the port to come up
-            // so the initial page navigation hits a live server.
-            match spawn_sidecar(&handle) {
-                Ok(child) => {
+            // so the initial page navigation hits a live server. If the sidecar dies early
+            // (most commonly: EADDRINUSE because another rikkahub-pc.exe / rikkahub-server.exe
+            // is already on port 8080), show an error dialog and quit — otherwise the webview
+            // would silently load the orphan's UI without Tauri's internals injected, leaving
+            // the user with a window that has no titlebar and a non-functional app.
+            let child_dead = match spawn_sidecar(&handle) {
+                Ok((child, dead)) => {
                     if let Some(state) = handle.try_state::<SidecarState>() {
                         *state.child.lock().unwrap() = Some(child);
                     }
+                    dead
                 }
                 Err(err) => {
-                    eprintln!("Sidecar startup failed: {err}");
-                    // Continue — the webview will show its own error toast when /api fails.
+                    show_startup_error(&handle, &format!("Rikkahub 后端启动失败：\n\n{err}"));
+                    handle.exit(1);
+                    return Ok(());
+                }
+            };
+
+            match wait_for_sidecar_ready(SIDECAR_READY_TIMEOUT, &child_dead) {
+                Ok(()) => {
+                    handle.emit("sidecar://ready", true).ok();
+                }
+                Err(msg) => {
+                    show_startup_error(&handle, &msg);
+                    handle.exit(1);
+                    return Ok(());
                 }
             }
-
-            let ready = wait_for_sidecar_ready(SIDECAR_READY_TIMEOUT);
-            handle
-                .emit("sidecar://ready", ready)
-                .ok();
 
             Ok(())
         })
