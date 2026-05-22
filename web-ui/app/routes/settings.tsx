@@ -4278,6 +4278,8 @@ function DataSection({ settings, onSettings }: { settings: Settings; onSettings:
   const importInputRef = React.useRef<HTMLInputElement>(null);
   const [exporting, setExporting] = React.useState(false);
   const [importing, setImporting] = React.useState(false);
+  const [importPhase, setImportPhase] = React.useState<"idle" | "uploading" | "processing">("idle");
+  const [importProgress, setImportProgress] = React.useState(0); // 0-100 during upload
   const defaultWebDav = (settings.webDavConfig ?? { url: "", username: "", password: "", path: "rikkahub_backups", items: ["DATABASE", "FILES"] }) as WebDavConfig;
   const [webDavDraft, setWebDavDraft] = React.useState<WebDavConfig>(defaultWebDav);
   const [webDavItems, setWebDavItems] = React.useState<WebDavBackupItem[]>([]);
@@ -4508,15 +4510,66 @@ function DataSection({ settings, onSettings }: { settings: Settings; onSettings:
     if (!window.confirm("导入会覆盖当前本地设置、会话和日志。继续？")) return;
 
     setImporting(true);
+    setImportPhase("uploading");
+    setImportProgress(0);
     try {
-      const formData = new FormData();
-      formData.append("file", file, file.name);
-      const result = await api.postMultipart<{
+      // Stream the file body directly to /api/data/import as application/octet-stream rather
+      // than wrap it in multipart/form-data. Two reasons:
+      //   1. Users have reported 10+ GB backups. `Buffer.from(await file.arrayBuffer())` on
+      //      the server doubles JS heap memory; with streaming, the server writes chunks
+      //      straight to disk and never holds the full body in memory.
+      //   2. fetch() can't report upload progress. XMLHttpRequest can. We need the progress
+      //      bar so the user doesn't think the app froze during a multi-GB upload.
+      // The backend's data/import endpoint detects octet-stream via Content-Type and routes
+      // to the streaming path; multipart still works as a fallback.
+      const result = await new Promise<{
         status: string;
         source?: string;
         summary?: string[];
         settings: Settings;
-      }>("data/import", formData);
+      }>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        // Auth token goes via the query-string helper since XHR doesn't run through the
+        // ky beforeRequest hook that would otherwise inject the Authorization header.
+        xhr.open("POST", appendWebAuthQuery("/api/data/import"));
+        xhr.setRequestHeader("Content-Type", "application/octet-stream");
+        // X-Filename lets the server log the original name (useful for triage); the magic
+        // bytes still determine format. Filename is URI-encoded so non-ASCII names survive.
+        xhr.setRequestHeader("X-Filename", encodeURIComponent(file.name));
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 100);
+            setImportProgress(pct);
+          }
+        };
+        xhr.upload.onload = () => {
+          // Upload finished, but server is still processing — switch phase so the UI shows
+          // the indeterminate "processing" hint instead of stuck-at-100% progress bar.
+          setImportPhase("processing");
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              resolve(JSON.parse(xhr.responseText));
+            } catch (err) {
+              reject(new Error("Invalid server response"));
+            }
+          } else {
+            // Try to surface the server-side error message rather than the raw status code.
+            let serverError = `HTTP ${xhr.status}`;
+            try {
+              const parsed = JSON.parse(xhr.responseText) as { error?: string };
+              if (parsed.error) serverError = parsed.error;
+            } catch { /* keep status code */ }
+            reject(new Error(serverError));
+          }
+        };
+        xhr.onerror = () => reject(new Error("网络错误，请检查后端服务是否在运行"));
+        xhr.onabort = () => reject(new Error("上传被中止"));
+        // No timeout — large backups may take 10+ minutes through upload + extract + SQLite.
+        xhr.timeout = 0;
+        xhr.send(file);
+      });
       onSettings(result.settings);
       if (result.source === "android-zip") {
         const lines = (result.summary ?? []).filter(Boolean);
@@ -4528,6 +4581,8 @@ function DataSection({ settings, onSettings }: { settings: Settings; onSettings:
       toast.error(error instanceof Error ? error.message : "导入失败");
     } finally {
       setImporting(false);
+      setImportPhase("idle");
+      setImportProgress(0);
     }
   };
 
@@ -4537,7 +4592,7 @@ function DataSection({ settings, onSettings }: { settings: Settings; onSettings:
       <div className="grid gap-4 md:grid-cols-2">
         <div className="rounded-lg border bg-card p-4">
           <div className="text-sm font-medium">数据备份</div>
-          <div className="mt-1 text-xs text-muted-foreground">导出或导入本地 JSON 状态，包含设置、会话、文件索引和请求日志。导入也兼容 Android 端导出的 .zip 备份（设置/附件/Skills，对话历史除外）。</div>
+          <div className="mt-1 text-xs text-muted-foreground">导出或导入本地 JSON 状态，包含设置、会话、文件索引和请求日志。导入也兼容 Android 端导出的 .zip 备份（设置 / 附件 / Skills / 对话历史 / MCP / 提示注入 / 世界书 / 快捷消息）。备份较大时导入可能需要 1-2 分钟。</div>
           <div className="mt-4 flex flex-wrap gap-2">
             <Button variant="outline" onClick={() => void exportData()} disabled={exporting}>
               {exporting ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
@@ -4549,6 +4604,30 @@ function DataSection({ settings, onSettings }: { settings: Settings; onSettings:
             </Button>
             <input ref={importInputRef} className="sr-only" type="file" accept="application/json,.json,application/zip,.zip" onChange={(event) => void importData(event)} />
           </div>
+          {importing ? (
+            <div className="mt-3 space-y-1.5">
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span>
+                  {importPhase === "uploading" && "正在上传备份文件..."}
+                  {importPhase === "processing" && "上传完成，正在解压并导入数据..."}
+                  {importPhase === "idle" && "准备中..."}
+                </span>
+                {importPhase === "uploading" ? <span>{importProgress}%</span> : null}
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                <div
+                  className={cn(
+                    "h-full bg-primary transition-all",
+                    importPhase === "processing" && "animate-pulse w-full",
+                  )}
+                  style={importPhase === "uploading" ? { width: `${importProgress}%` } : undefined}
+                />
+              </div>
+              {importPhase === "processing" ? (
+                <div className="text-[11px] text-muted-foreground">大备份的对话历史解析可能需要几分钟，请勿关闭应用</div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
         <div className="rounded-lg border bg-card p-4">
           <div className="text-sm font-medium">聊天文件储存</div>
@@ -5025,7 +5104,7 @@ function AboutSection() {
   // Hard-coded current version — must match pc-server/server.ts:APP_VERSION and
   // web-ui/src-tauri/tauri.conf.json:version. The update checker compares this against
   // the latest GitHub release.
-  const APP_VERSION = "1.0.1";
+  const APP_VERSION = "1.0.2";
 
   type UpdateInfo = {
     current: string;

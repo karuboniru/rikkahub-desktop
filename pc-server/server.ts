@@ -380,7 +380,7 @@ const statePath = join(dataDir, "state.json");
 // MUST be kept in sync with web-ui/src-tauri/tauri.conf.json's `version` field. The update
 // checker compares this against the latest GitHub release tag and the version is also shown
 // verbatim in the About page. If you bump tauri.conf.json's version, bump this too.
-const APP_VERSION = "1.0.1";
+const APP_VERSION = "1.0.2";
 
 /** Compare two dotted-version strings. Returns -1/0/1 like `a - b`. Tolerates "v" prefix,
  *  missing patch parts (treated as 0), and non-numeric trailing labels (compared as strings). */
@@ -2271,19 +2271,18 @@ function applyBackupPayload(body: { state?: Partial<State>; skills?: unknown; fi
  * Uses PowerShell's Expand-Archive (ships on every supported Windows) to extract — no
  * extra dependency in the compiled exe.
  */
-function applyAndroidZipBackup(zipBuffer: Buffer): { settingsImported: boolean; filesImported: number; skillsImported: number; conversationsImported: number; dbReadError: string | null } {
-  const tmpRoot = join(dataDir, ".import-tmp");
-  rmSync(tmpRoot, { recursive: true, force: true });
-  mkdirSync(tmpRoot, { recursive: true });
-  const zipPath = join(tmpRoot, "backup.zip");
-  writeFileSync(zipPath, zipBuffer);
+function applyAndroidZipBackupFromPath(zipPath: string): { settingsImported: boolean; filesImported: number; skillsImported: number; conversationsImported: number; dbReadError: string | null } {
+  // Caller is expected to have already written the zip to disk (streamed from request.body
+  // for the large-file path). We accept a path rather than a Buffer because users have
+  // reported backups in the 1-10 GB range — buffering those in JS heap is not feasible.
+  const tmpRoot = dirname(zipPath);
   const extractDir = join(tmpRoot, "extracted");
+  rmSync(extractDir, { recursive: true, force: true });
   mkdirSync(extractDir, { recursive: true });
   // PowerShell quoting on Windows is finicky; use simple paths under our temp dir.
   const script = `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`;
   const proc = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]);
   if (proc.exitCode !== 0) {
-    rmSync(tmpRoot, { recursive: true, force: true });
     throw new Error(`Failed to extract Android backup zip: ${new TextDecoder().decode(proc.stderr ?? new Uint8Array()).slice(0, 300)}`);
   }
 
@@ -2366,7 +2365,9 @@ function applyAndroidZipBackup(zipBuffer: Buffer): { settingsImported: boolean; 
   broadcastSettings();
   broadcastList();
 
-  rmSync(tmpRoot, { recursive: true, force: true });
+  // Clean up the extracted/ subdir; the caller owns and cleans tmpRoot (which still holds
+  // the original streamed zip until they decide to remove the whole thing).
+  rmSync(extractDir, { recursive: true, force: true });
   return { settingsImported, filesImported, skillsImported, conversationsImported, dbReadError };
 }
 
@@ -10752,18 +10753,80 @@ async function routeApi(request: Request, url: URL) {
     });
   }
   if (path === "data/import" && request.method === "POST") {
-    // Two-format compatibility: PC's own export is a JSON document, while the Android client
-    // exports a ZIP (settings.json + Room SQLite + upload/ + skills/). We accept the file as
-    // a multipart upload and route by the first 4 magic bytes — `PK\x03\x04` → ZIP, anything
-    // else → text → JSON.parse.
+    // Two upload paths supported:
+    //   • multipart/form-data — legacy path, used by the in-browser import UI for small
+    //     backups. `request.formData()` buffers the whole upload in JS heap.
+    //   • application/octet-stream — streaming path used for large backups (1-10+ GB).
+    //     The frontend sends the raw file body with an `X-Filename` header; we pipe
+    //     `request.body` directly to a temp file on disk, never buffering the whole thing
+    //     in memory. Required because some users report 10 GB+ backups.
+    //
+    // Format detection (zip vs PC json) is done on the on-disk file's first 4 bytes after
+    // the upload completes, regardless of which path we took.
+    const importStartedAt = Date.now();
+    const tmpRoot = join(dataDir, ".import-tmp");
     try {
-      const form = await request.formData();
-      const file = form.get("file");
-      if (!(file instanceof File)) return error("No backup file uploaded", 400);
-      const buffer = Buffer.from(await file.arrayBuffer());
-      const isZip = buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4B && buffer[2] === 0x03 && buffer[3] === 0x04;
+      rmSync(tmpRoot, { recursive: true, force: true });
+      mkdirSync(tmpRoot, { recursive: true });
+      // The on-disk temp file MUST end in `.zip` even though we don't know the format yet —
+      // PowerShell's `Expand-Archive` checks the extension (not magic bytes) and refuses
+      // anything else with "not a supported archive file format". For the PC-JSON path
+      // the extension is a harmless lie; we still detect format from magic bytes below.
+      const onDiskPath = join(tmpRoot, "backup.zip");
+
+      const contentType = (request.headers.get("Content-Type") ?? "").toLowerCase();
+      let originalFilename = request.headers.get("X-Filename") ?? "backup";
+
+      if (contentType.startsWith("application/octet-stream") || contentType.startsWith("application/zip")) {
+        // STREAMING PATH — pipe request.body straight to disk.
+        const body = request.body;
+        if (!body) {
+          return error("No request body", 400);
+        }
+        const writer = Bun.file(onDiskPath).writer();
+        const reader = body.getReader();
+        let bytesReceived = 0;
+        let lastLog = Date.now();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            writer.write(value);
+            bytesReceived += value.length;
+            // Log every 5s so a 10-minute upload doesn't go silent in the console.
+            if (Date.now() - lastLog > 5000) {
+              console.log(`[import] streamed ${(bytesReceived / (1024 * 1024)).toFixed(1)} MB so far...`);
+              lastLog = Date.now();
+            }
+          }
+        } finally {
+          await writer.end();
+        }
+        console.log(`[import] streamed upload complete: ${originalFilename} ${(bytesReceived / (1024 * 1024)).toFixed(1)} MB`);
+      } else {
+        // LEGACY MULTIPART PATH — works for small backups only.
+        console.log("[import] receiving multipart upload...");
+        const form = await request.formData();
+        const file = form.get("file");
+        if (!(file instanceof File)) {
+          console.warn("[import] no file in form data");
+          return error("No backup file uploaded", 400);
+        }
+        originalFilename = file.name;
+        const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+        console.log(`[import] multipart file ${file.name} (${sizeMB} MB), buffering then writing to disk...`);
+        writeFileSync(onDiskPath, Buffer.from(await file.arrayBuffer()));
+      }
+
+      // Detect format from first 4 bytes of the on-disk file.
+      const magicBytes = new Uint8Array(await Bun.file(onDiskPath).slice(0, 4).arrayBuffer());
+      const isZip = magicBytes.length >= 4 && magicBytes[0] === 0x50 && magicBytes[1] === 0x4B && magicBytes[2] === 0x03 && magicBytes[3] === 0x04;
+      console.log(`[import] file format: ${isZip ? "Android zip" : "PC json"}`);
+
       if (isZip) {
-        const summary = applyAndroidZipBackup(buffer);
+        const summary = applyAndroidZipBackupFromPath(onDiskPath);
+        const elapsed = ((Date.now() - importStartedAt) / 1000).toFixed(1);
+        console.log(`[import] Android zip processed in ${elapsed}s: settings=${summary.settingsImported} files=${summary.filesImported} skills=${summary.skillsImported} convs=${summary.conversationsImported} dbErr=${summary.dbReadError ?? "none"}`);
         const messages = [
           summary.settingsImported ? "已恢复设置（供应商、助手、搜索服务、MCP、提示注入、世界书、快捷消息）" : "未发现可恢复的设置文件",
           summary.conversationsImported ? `已恢复 ${summary.conversationsImported} 条对话历史` : "",
@@ -10773,12 +10836,21 @@ async function routeApi(request: Request, url: URL) {
         ].filter(Boolean);
         return json({ status: "imported", source: "android-zip", summary: messages, settings: state.settings });
       }
-      const text = buffer.toString("utf-8");
+      // PC JSON path — safe to read fully into memory; JSON backups are KB-MB, not GB.
+      const text = readFileSync(onDiskPath, "utf-8");
       const body = JSON.parse(text) as { state?: Partial<State>; skills?: unknown } & Partial<State>;
       applyBackupPayload(body);
+      const elapsed = ((Date.now() - importStartedAt) / 1000).toFixed(1);
+      console.log(`[import] PC json processed in ${elapsed}s`);
       return json({ status: "imported", source: "pc-json", settings: state.settings });
     } catch (err) {
+      const elapsed = ((Date.now() - importStartedAt) / 1000).toFixed(1);
+      console.error(`[import] failed after ${elapsed}s:`, err);
       return error(err instanceof Error ? err.message : "Invalid backup file", 400);
+    } finally {
+      // Always clean up the upload temp dir on success or failure. Avoids accumulating
+      // 10+ GB of stale uploads on disk if the user retries.
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
 
@@ -11065,6 +11137,11 @@ const server = (() => {
     return Bun.serve({
       port,
       idleTimeout: 0,
+      // Default is 128 MB — way too small. Users have reported backup zips of 10+ GB
+      // (months of conversations + image attachments). The streaming `data/import` path
+      // never holds the full body in memory anyway (pipes request.body directly to disk),
+      // so this just acts as a sanity-check ceiling against truly absurd uploads.
+      maxRequestBodySize: 64 * 1024 * 1024 * 1024,
       async fetch(request, server) {
         server.timeout(request, 0);
         const url = new URL(request.url);
